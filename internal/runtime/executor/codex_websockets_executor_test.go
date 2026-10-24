@@ -29,6 +29,108 @@ import (
 
 var benchmarkBuildCodexWebsocketRequestBodyOutput []byte
 
+func TestCodexWebsocketsCompactionUsesHTTP(t *testing.T) {
+	for _, streaming := range []bool{false, true} {
+		for _, trigger := range []string{"manual", "auto"} {
+			t.Run(fmt.Sprintf("streaming=%t/%s", streaming, trigger), func(t *testing.T) {
+				var httpRequests, websocketRequests atomic.Int32
+				completed := []byte(`{"type":"response.completed","response":{"id":"resp-compaction","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"summary"}]}],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}`)
+				upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+				server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					if r.Method == http.MethodPost {
+						httpRequests.Add(1)
+						body, errRead := io.ReadAll(r.Body)
+						if errRead != nil {
+							t.Errorf("read HTTP request: %v", errRead)
+							return
+						}
+						if r.URL.Path != "/responses" || gjson.GetBytes(body, "type").Exists() {
+							t.Errorf("invalid HTTP envelope: path=%s type=%s", r.URL.Path, gjson.GetBytes(body, "type").Raw)
+						}
+						if got := gjson.GetBytes(body, "input.0.content").String(); got != "full history" {
+							t.Errorf("history = %q, want full history", got)
+						}
+						if got := gjson.GetBytes(body, "instructions").String(); got != "configured instructions" {
+							t.Errorf("payload override = %q, want configured instructions", got)
+						}
+						w.Header().Set("Content-Type", "text/event-stream")
+						_, _ = fmt.Fprintf(w, "data: %s\n\n", completed)
+						return
+					}
+					websocketRequests.Add(1)
+					conn, errUpgrade := upgrader.Upgrade(w, r, nil)
+					if errUpgrade != nil {
+						t.Errorf("upgrade websocket: %v", errUpgrade)
+						return
+					}
+					defer func() { _ = conn.Close() }()
+					if _, _, errRead := conn.ReadMessage(); errRead != nil {
+						t.Errorf("read websocket request: %v", errRead)
+						return
+					}
+					if errWrite := conn.WriteMessage(websocket.TextMessage, completed); errWrite != nil {
+						t.Errorf("write websocket completion: %v", errWrite)
+					}
+				}))
+				defer server.Close()
+				exec := NewCodexAutoExecutor(&config.Config{
+					SDKConfig: config.SDKConfig{DisableImageGeneration: config.DisableImageGenerationAll},
+					Payload: config.PayloadConfig{Override: []config.PayloadRule{{
+						Models: []config.PayloadModelRule{{Name: "gpt-5-codex", Protocol: "codex"}},
+						Params: map[string]any{"instructions": "configured instructions"},
+					}}},
+				})
+				auth := &cliproxyauth.Auth{Provider: "codex", Attributes: map[string]string{
+					"api_key": "sk-test", "base_url": server.URL, "websockets": "true",
+				}}
+				ctx := cliproxyexecutor.WithDownstreamWebsocket(t.Context())
+				for _, kind := range []string{"compaction", "turn"} {
+					metadata := fmt.Sprintf(`{"request_kind":%q,"compaction":{"trigger":%q}}`, kind, trigger)
+					payload := []byte(fmt.Sprintf(`{"type":"response.create","model":"gpt-5-codex","input":[{"type":"message","role":"user","content":"full history"}],"client_metadata":{"x-codex-turn-metadata":%q}}`, metadata))
+					req := cliproxyexecutor.Request{Model: "gpt-5-codex", Payload: payload}
+					// The upgrade's metadata remains a compaction even when the next message is a normal turn.
+					opts := cliproxyexecutor.Options{
+						SourceFormat:    sdktranslator.FromString("openai-response"),
+						ResponseFormat:  sdktranslator.FromString("openai-response"),
+						OriginalRequest: payload,
+						Headers:         http.Header{"X-Codex-Turn-Metadata": {`{"request_kind":"compaction"}`}},
+					}
+					if streaming {
+						result, errExecute := exec.ExecuteStream(ctx, auth, req, opts)
+						if errExecute != nil {
+							t.Fatalf("ExecuteStream(%s): %v", kind, errExecute)
+						}
+						var output []byte
+						for chunk := range result.Chunks {
+							if chunk.Err != nil {
+								t.Fatalf("stream %s: %v", kind, chunk.Err)
+							}
+							output = append(output, chunk.Payload...)
+						}
+						if !bytes.Contains(output, []byte("response.completed")) {
+							t.Fatalf("stream %s did not complete", kind)
+						}
+					} else {
+						result, errExecute := exec.Execute(ctx, auth, req, opts)
+						if errExecute != nil {
+							t.Fatalf("Execute(%s): %v", kind, errExecute)
+						}
+						if !bytes.Contains(result.Payload, []byte("summary")) {
+							t.Fatalf("response %s lost its output", kind)
+						}
+					}
+				}
+				if got := httpRequests.Load(); got != 1 {
+					t.Errorf("HTTP requests = %d, want 1", got)
+				}
+				if got := websocketRequests.Load(); got != 1 {
+					t.Errorf("websocket requests = %d, want 1", got)
+				}
+			})
+		}
+	}
+}
+
 func TestBuildCodexWebsocketRequestBodyPreservesPreviousResponseID(t *testing.T) {
 	body := []byte(`{"model":"gpt-5-codex","previous_response_id":"resp-1","input":[{"type":"message","id":"msg-1"}]}`)
 

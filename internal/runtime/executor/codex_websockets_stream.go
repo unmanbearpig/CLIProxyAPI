@@ -27,6 +27,11 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 	if opts.Alt == "responses/compact" {
 		return nil, statusErr{code: http.StatusBadRequest, msg: "streaming not supported for /responses/compact"}
 	}
+	if helps.IsCodexCompactionRequest(req.Payload) {
+		log.Debugf("codex websockets: routing compaction over HTTP to avoid the websocket message size limit (model: %s)", req.Model)
+		helps.StripCodexWebsocketEnvelopeType(&req, &opts)
+		return e.CodexExecutor.ExecuteStream(ctx, auth, req, opts)
+	}
 
 	baseModel := thinking.ParseSuffix(req.Model).ModelName
 
